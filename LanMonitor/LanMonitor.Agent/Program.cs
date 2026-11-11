@@ -1,7 +1,9 @@
-﻿using LanMonitor.Shared;
+﻿using LanMonitor.Agent;
 
-string msg = Protocol.Build("STATS", ("cpu", "45"), ("ram", "70"));
-Console.Write(msg);                       // STATS|cpu=45|ram=70
+using var mon = new SystemMonitor();
 
-var (cmd, data) = Protocol.Parse(msg);
-Console.WriteLine($"{cmd}: cpu={data["cpu"]}, ram={data["ram"]}");
+while (true)
+{
+    await Task.Delay(3000);
+    Console.WriteLine($"CPU={mon.GetCpu()}%  RAM={mon.GetRam()}%  DISK={mon.GetDisk()}%");
+}
