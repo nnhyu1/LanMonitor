@@ -6,6 +6,23 @@ using LanMonitor.Shared;
 var listener = new TcpListener(IPAddress.Any, Protocol.TcpPort);
 listener.Start();
 Console.WriteLine($"Fake server đang nghe cổng {Protocol.TcpPort}... (Ctrl+C để dừng)");
+_ = Task.Run(async () =>
+{
+    using var udp = new UdpClient(Protocol.UdpPort);
+    Console.WriteLine($"Đang nghe UDP {Protocol.UdpPort} để trả lời DISCOVER...");
+    while (true)
+    {
+        var r = await udp.ReceiveAsync();
+        var (cmd, _) = Protocol.Parse(Encoding.UTF8.GetString(r.Buffer));
+        if (cmd == "DISCOVER")
+        {
+            byte[] offer = Encoding.UTF8.GetBytes(
+                Protocol.Build("OFFER", ("tcpPort", Protocol.TcpPort.ToString())));
+            await udp.SendAsync(offer, offer.Length, r.RemoteEndPoint);
+            Console.WriteLine($"  Đã trả lời DISCOVER từ {r.RemoteEndPoint}");
+        }
+    }
+});
 
 while (true)
 {
