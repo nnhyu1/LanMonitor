@@ -8,17 +8,16 @@ namespace LanMonitor.Agent;
 
 public class AgentClient
 {
-    private readonly string _host;
+       private readonly Func<CancellationToken, Task<string?>> _hostProvider;
     private readonly int _port;
     private readonly SystemMonitor _mon;
 
-    public AgentClient(string host, int port, SystemMonitor mon)
+    public AgentClient(Func<CancellationToken, Task<string?>> hostProvider, int port, SystemMonitor mon)
     {
-        _host = host;
+        _hostProvider = hostProvider;
         _port = port;
         _mon = mon;
     }
-
     // Vòng lặp chính: mất kết nối thì chờ 5 giây rồi thử lại
     public async Task RunAsync(CancellationToken ct)
     {
@@ -26,7 +25,11 @@ public class AgentClient
         {
             try
             {
-                await ConnectAndSendAsync(ct);
+                string? host = await _hostProvider(ct);
+                if (host == null)
+                    Console.WriteLine("Không thấy server nào trả lời.");
+                else
+                    await ConnectAndSendAsync(host, ct);
             }
             catch (OperationCanceledException)
             {
@@ -43,11 +46,11 @@ public class AgentClient
         }
     }
 
-    private async Task ConnectAndSendAsync(CancellationToken ct)
+        private async Task ConnectAndSendAsync(string host, CancellationToken ct)
     {
         using var client = new TcpClient();
-        Console.WriteLine($"Đang kết nối tới {_host}:{_port}...");
-        await client.ConnectAsync(_host, _port, ct);
+        Console.WriteLine($"Đang kết nối tới {host}:{_port}...");
+        await client.ConnectAsync(host, _port, ct);
         Console.WriteLine("Đã kết nối.");
 
         using var stream = client.GetStream();
