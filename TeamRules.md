@@ -20,9 +20,9 @@ Dự án: **LanMonitor** - hệ thống giám sát máy tính trong mạng LAN (
 | 4 | Agent: tự tìm server bằng UDP broadcast | Huy | Hoàn thành |
 | 5 | Server: nhận nhiều Agent, timeout, `WELCOME`/`OFFER` | Phong | Hoàn thành |
 | 6 | Dashboard: bảng máy, cảnh báo, đồ thị, nhật ký | Phong | Hoàn thành |
-| 7 | Agent: xử lý lỗi, kiểm tra tin nhắn | Huy | Đang làm |
-| 8 | Kiểm thử tích hợp Agent + Server | Cả hai | Chưa làm |
-| 9 | Tài liệu, báo cáo, slide, demo | Cả hai | Chưa làm |
+| 7 | Agent: xử lý lỗi, kiểm tra tin nhắn | Huy | Hoàn Thành |
+| 8 | Kiểm thử tích hợp Agent + Server | Cả hai | Hoàn Thành |
+
 
 Cập nhật cột "Trạng thái" mỗi tuần.
 
