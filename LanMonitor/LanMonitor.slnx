@@ -1,6 +1,5 @@
 <Solution>
   <Project Path="LanMonitor.Agent/LanMonitor.Agent.csproj" />
-  <Project Path="LanMonitor.FakeServer/LanMonitor.FakeServer.csproj" />
   <Project Path="LanMonitor.Server/LanMonitor.Server.csproj" />
   <Project Path="LanMonitor.Shared/LanMonitor.Shared.csproj" />
 </Solution>
