@@ -32,7 +32,7 @@ Dự án: **LanMonitor** - hệ thống giám sát máy tính trong mạng LAN (
 6. Tên commit ngắn, nói rõ việc đã làm (ví dụ: `Agent: reconnect when server closes`).
 7. `main` luôn phải **build được**.
 
-## 6. Tiêu chí "hoàn thành" một công việc
+## 4. Tiêu chí "hoàn thành" một công việc
 - Code chạy được, đã thử với đối tác (Agent với Server).
 - Đã merge vào `main` qua Pull Request.
 - Đã cập nhật tài liệu liên quan (README hoặc SETUP).
