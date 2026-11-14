@@ -24,25 +24,13 @@ Dự án: **LanMonitor** - hệ thống giám sát máy tính trong mạng LAN (
 | 8 | Kiểm thử tích hợp Agent + Server | Cả hai | Hoàn Thành |
 
 
-Cập nhật cột "Trạng thái" mỗi tuần.
-
 ## 3. Quy tắc phối hợp
 1. **Mỗi tính năng một nhánh** (`agent-...`, `server-...`), gộp vào `main` bằng Pull Request.
 2. **Người kia xem qua Pull Request** trước khi merge (xem nhanh, chạy thử nếu thay đổi lớn).
-3. **Không commit thẳng** những thay đổi lớn vào `main`.
 4. **`LanMonitor.Shared` (giao thức) là của chung**: muốn đổi phải báo người còn lại trước.
 5. Không commit `bin/`, `obj/`, file `*.user` (đã có trong `.gitignore`).
 6. Tên commit ngắn, nói rõ việc đã làm (ví dụ: `Agent: reconnect when server closes`).
 7. `main` luôn phải **build được**.
-
-## 4. Giao tiếp
-- Trao đổi hằng ngày qua tin nhắn nhóm.
-- Họp ngắn **mỗi tuần một lần** để chốt việc tuần tới và cập nhật bảng ở mục 2.
-- Gặp vướng mắc quá **1 ngày** thì báo ngay để người kia hỗ trợ.
-
-## 5. Xử lý bất đồng và chậm tiến độ
-- Bất đồng về thiết kế: mỗi người nêu lý do, ưu tiên phương án đơn giản hơn và đúng với kiến thức môn học. Không thống nhất được thì hỏi giảng viên.
-- Việc chậm quá hạn đã hẹn: người phụ trách báo sớm, hai bên dời hoặc chia lại việc.
 
 ## 6. Tiêu chí "hoàn thành" một công việc
 - Code chạy được, đã thử với đối tác (Agent với Server).
