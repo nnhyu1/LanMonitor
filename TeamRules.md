@@ -8,7 +8,7 @@ Dự án: **LanMonitor** - hệ thống giám sát máy tính trong mạng LAN (
 |---|---|
 | Nguyễn Nhật Huy | Agent (đo CPU/RAM/DISK, gửi qua TCP, UDP discovery, tự kết nối lại), giao thức dùng chung |
 | Bùi Tuấn Phong | Server (nhận nhiều Agent async, timeout), dashboard WinForms, cảnh báo, đồ thị |
-| Cả hai | Kiểm thử tích hợp, tài liệu, báo cáo, slide, demo |
+| Cả hai | Kiểm thử tích hợp, chạy thử demo |
 
 ## 2. Bảng theo dõi công việc
 
