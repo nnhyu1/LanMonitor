@@ -12,9 +12,21 @@ public class AgentInfo
     public int Ram { get; set; }
     public int Disk { get; set; }
     public bool Online { get; set; }
+    public DateTime ConnectedAt { get; set; } = DateTime.Now;
     public DateTime LastSeen { get; set; } = DateTime.Now;
 
-    // Lịch sử mẫu đo gần nhất để vẽ đồ thị xu hướng thời gian thực khi chọn máy
+    // Thống kê hiệu năng trong phiên để phục vụ So sánh giữa 2 máy
+    public int PeakCpu { get; private set; }
+    public int PeakRam { get; private set; }
+    public long TotalCpuSamples { get; private set; }
+    public long TotalRamSamples { get; private set; }
+    public int SampleCount { get; private set; }
+    public long? LastPingMs { get; set; }
+
+    public int AvgCpu => SampleCount > 0 ? (int)Math.Round((double)TotalCpuSamples / SampleCount) : Cpu;
+    public int AvgRam => SampleCount > 0 ? (int)Math.Round((double)TotalRamSamples / SampleCount) : Ram;
+
+    // Lịch sử mẫu đo gần nhất để vẽ đồ thị xu hướng thời gian thực
     public List<int> CpuHistory { get; } = new();
     public List<int> RamHistory { get; } = new();
 
@@ -26,6 +38,12 @@ public class AgentInfo
         Cpu = Math.Clamp(cpu, 0, 100);
         Ram = Math.Clamp(ram, 0, 100);
         Disk = Math.Clamp(disk, 0, 100);
+
+        if (Cpu > PeakCpu) PeakCpu = Cpu;
+        if (Ram > PeakRam) PeakRam = Ram;
+        TotalCpuSamples += Cpu;
+        TotalRamSamples += Ram;
+        SampleCount++;
 
         lock (CpuHistory)
         {
@@ -39,7 +57,6 @@ public class AgentInfo
         }
     }
 
-    // Kiểm tra xem có thông số nào vượt ngưỡng không
     public string GetAlertText(int cpuLimit, int ramLimit, int diskLimit)
     {
         if (!Online) return "Ngắt kết nối (Offline)";

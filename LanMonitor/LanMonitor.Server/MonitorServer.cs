@@ -14,6 +14,7 @@ public class MonitorServer
 
     // Danh sách các máy đã kết nối (Key = Tên máy + IP)
     public ConcurrentDictionary<string, AgentInfo> Agents { get; } = new();
+    private readonly ConcurrentDictionary<string, TcpClient> _activeClients = new();
 
     // Chu kỳ gửi báo cáo (giây) gửi cho Agent trong bản tin WELCOME
     public int ReportIntervalSeconds { get; set; } = 3;
@@ -45,6 +46,12 @@ public class MonitorServer
         try { _tcpListener?.Stop(); } catch { }
         try { _udpListener?.Close(); } catch { }
         _cts = null;
+
+        foreach (var kv in _activeClients)
+        {
+            try { kv.Value.Close(); } catch { }
+        }
+        _activeClients.Clear();
 
         foreach (var agent in Agents.Values)
         {
@@ -146,12 +153,13 @@ public class MonitorServer
                         string os = data.GetValueOrDefault("os", "Unknown OS");
 
                         string key = $"{name}@{ip}";
-                        agent = Agents.GetOrAdd(key, _ => new AgentInfo { Key = key });
+                        agent = Agents.GetOrAdd(key, _ => new AgentInfo { Key = key, ConnectedAt = DateTime.Now });
                         agent.Name = name;
                         agent.Ip = ip;
                         agent.Os = os;
                         agent.Online = true;
                         agent.LastSeen = DateTime.Now;
+                        _activeClients[key] = client;
 
                         int interval = ReportIntervalSeconds;
                         await writer.WriteAsync(Protocol.Build("WELCOME", ("interval", interval.ToString())));
@@ -171,6 +179,7 @@ public class MonitorServer
                                 Name = "Unknown",
                                 Ip = remoteIp
                             });
+                            _activeClients[key] = client;
                         }
 
                         int cpu = agent.Cpu, ram = agent.Ram, disk = agent.Disk;
@@ -203,12 +212,43 @@ public class MonitorServer
         {
             if (agent != null)
             {
+                if (_activeClients.TryGetValue(agent.Key, out var current) && ReferenceEquals(current, client))
+                    _activeClients.TryRemove(agent.Key, out _);
+
                 agent.Online = false;
                 agent.WasAlerting = false;
                 Log($"[-] Máy '{agent.Name}' ({agent.Ip}) chuyển sang trạng thái Offline.");
                 AgentUpdated?.Invoke(agent);
             }
         }
+    }
+
+    // Kick (ngắt kết nối cưỡng bức) 1 máy trạm theo Key
+    public bool KickAgent(string key)
+    {
+        if (!Agents.TryGetValue(key, out var agent))
+            return false;
+
+        if (_activeClients.TryRemove(key, out var client))
+        {
+            try
+            {
+                if (client.Connected)
+                {
+                    byte[] msg = Encoding.UTF8.GetBytes(Protocol.Build("KICK", ("reason", "Admin")));
+                    client.GetStream().Write(msg, 0, msg.Length);
+                }
+            }
+            catch { }
+
+            try { client.Close(); } catch { }
+        }
+
+        agent.Online = false;
+        agent.WasAlerting = false;
+        Log($"[Kick] Đã ngắt kết nối máy '{agent.Name}' ({agent.Ip}) theo yêu cầu quản trị viên.");
+        AgentUpdated?.Invoke(agent);
+        return true;
     }
 
     // Đánh dấu Offline các máy quá thời gian không gửi dữ liệu (rút dây mạng đột ngột)

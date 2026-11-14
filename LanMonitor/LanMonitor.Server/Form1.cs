@@ -1,5 +1,11 @@
+using System.Collections.Concurrent;
 using System.Drawing.Drawing2D;
+using System.Media;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text;
 using LanMonitor.Shared;
 
 namespace LanMonitor.Server;
@@ -8,23 +14,52 @@ public partial class Form1 : Form
 {
     private readonly MonitorServer _server = new();
     private readonly Dictionary<string, DataGridViewRow> _rowsByKey = new();
+    private AppSettings _settings = AppSettings.Load();
+    private bool _syncingControls;
+    private bool _allowExit;
 
-    private int CpuLimit => (int)numCpuLimit.Value;
-    private int RamLimit => (int)numRamLimit.Value;
-    private int DiskLimit => (int)numDiskLimit.Value;
+    // Trạng thái mô phỏng máy trạm ảo (Demo / Test)
+    private CancellationTokenSource? _demoCts;
+    private readonly ConcurrentDictionary<string, CancellationTokenSource> _demoAgentCts = new();
+    private DemoSimulationConfig _demoConfig = new(4, "PC-LAB", DemoLoadProfile.Mixed, DemoOsChoice.Mixed, false);
+
+    // Chuột phải & So sánh 2 máy & Hover
+    private string? _compareKeyA;
+    private int _hoveredRowIndex = -1;
+    private CompareForm? _compareForm;
+
+    private ToolStripMenuItem _miPing = null!;
+    private ToolStripMenuItem _miSetCompareA = null!;
+    private ToolStripMenuItem _miCompareWithA = null!;
+    private ToolStripMenuItem _miOpenCompare = null!;
+    private ToolStripMenuItem _miCopyIp = null!;
+    private ToolStripMenuItem _miKick = null!;
+    private ToolStripMenuItem _miRemove = null!;
+
+    private int CpuLimit => _settings.CpuLimit;
+    private int RamLimit => _settings.RamLimit;
+    private int DiskLimit => _settings.DiskLimit;
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
 
     public Form1()
     {
         InitializeComponent();
 
-        // Bật DoubleBuffered cho các control vẽ đồ họa thời gian thực để chống nhấp nháy (60fps)
         EnableDoubleBuffering(dgvAgents);
         EnableDoubleBuffering(pnlHeader);
+        EnableDoubleBuffering(pnlFooter);
         EnableDoubleBuffering(pnlChartCanvas);
         EnableDoubleBuffering(lstLogs);
 
         _server.AgentUpdated += OnAgentUpdated;
         _server.LogMessage += OnLogMessage;
+
+        SetupTrayIcon();
+        SetupAgentContextMenu();
+        WireSettingsDrawer();
+        ApplySettings(_settings, saveToDisk: false);
     }
 
     private static void EnableDoubleBuffering(Control ctrl)
@@ -35,60 +70,313 @@ public partial class Form1 : Form
             null, ctrl, new object[] { true });
     }
 
+    private void SetupTrayIcon()
+    {
+        // Tạo icon vector cho thanh taskbar & khay hệ thống
+        using var bmp = new Bitmap(32, 32);
+        using (var g = Graphics.FromImage(bmp))
+        {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using var bg = new SolidBrush(Color.FromArgb(37, 99, 235));
+            using var path = GraphicsExtensions.CreateRoundedRect(new Rectangle(1, 1, 30, 30), 7);
+            g.FillPath(bg, path);
+
+            using var pen = new Pen(Color.White, 2f);
+            Point p1 = new(16, 8), p2 = new(8, 22), p3 = new(24, 22);
+            g.DrawLine(pen, p1, p2);
+            g.DrawLine(pen, p1, p3);
+            g.DrawLine(pen, p2, p3);
+            g.FillEllipse(Brushes.White, p1.X - 2.5f, p1.Y - 2.5f, 5, 5);
+            g.FillEllipse(Brushes.White, p2.X - 2.5f, p2.Y - 2.5f, 5, 5);
+            g.FillEllipse(Brushes.White, p3.X - 2.5f, p3.Y - 2.5f, 5, 5);
+        }
+
+        IntPtr hIcon = bmp.GetHicon();
+        var icon = Icon.FromHandle(hIcon);
+        Icon = (Icon)icon.Clone();
+        trayIcon.Icon = (Icon)icon.Clone();
+
+        trayMenu.Items.Add("Mở Dashboard", null, (_, _) => RestoreFromTray());
+        trayMenu.Items.Add(new ToolStripSeparator());
+        trayMenu.Items.Add("Thoát hoàn toàn", null, (_, _) =>
+        {
+            _allowExit = true;
+            Close();
+        });
+        trayIcon.ContextMenuStrip = trayMenu;
+    }
+
+    private void SetupAgentContextMenu()
+    {
+        _miPing = new ToolStripMenuItem("Ping kiểm tra độ trễ (ICMP)");
+        _miPing.Click += async (_, _) =>
+        {
+            if (GetSelectedAgent() is { } agent)
+                await PingAgentAsync(agent);
+        };
+
+        _miSetCompareA = new ToolStripMenuItem("Đặt làm Máy A (So sánh)");
+        _miSetCompareA.Click += (_, _) =>
+        {
+            if (GetSelectedAgent() is { } agent)
+            {
+                _compareKeyA = agent.Key;
+                OnLogMessage($"[{DateTime.Now:HH:mm:ss}] [So sánh] Đã chọn '{agent.Name}' làm Máy A. Chuột phải máy thứ 2 để so sánh.");
+            }
+        };
+
+        _miCompareWithA = new ToolStripMenuItem("So sánh với Máy A");
+        _miCompareWithA.Click += (_, _) =>
+        {
+            if (GetSelectedAgent() is { } agentB)
+                OpenCompareDialog(_compareKeyA, agentB.Key);
+        };
+
+        _miOpenCompare = new ToolStripMenuItem("Mở bảng So sánh 2 máy...");
+        _miOpenCompare.Click += (_, _) =>
+        {
+            var sel = GetSelectedAgent();
+            OpenCompareDialog(_compareKeyA ?? sel?.Key, _compareKeyA != null ? sel?.Key : null);
+        };
+
+        _miCopyIp = new ToolStripMenuItem("Sao chép địa chỉ IP");
+        _miCopyIp.Click += (_, _) =>
+        {
+            if (GetSelectedAgent() is { } agent)
+            {
+                Clipboard.SetText(agent.Ip);
+                OnLogMessage($"[{DateTime.Now:HH:mm:ss}] Đã sao chép IP {agent.Ip} vào Clipboard.");
+            }
+        };
+
+        _miKick = new ToolStripMenuItem("Kick (Ngắt kết nối)")
+        {
+            Font = new Font(DesignTokens.FontBody, FontStyle.Bold)
+        };
+        _miKick.Click += (_, _) =>
+        {
+            if (GetSelectedAgent() is { } agent)
+                KickSelectedAgent(agent);
+        };
+
+        _miRemove = new ToolStripMenuItem("Xóa khỏi danh sách");
+        _miRemove.Click += (_, _) =>
+        {
+            if (GetSelectedAgent() is { } agent)
+                RemoveSingleAgent(agent);
+        };
+
+        agentMenu.Items.AddRange(new ToolStripItem[]
+        {
+            _miPing,
+            new ToolStripSeparator(),
+            _miSetCompareA,
+            _miCompareWithA,
+            _miOpenCompare,
+            new ToolStripSeparator(),
+            _miCopyIp,
+            new ToolStripSeparator(),
+            _miKick,
+            _miRemove
+        });
+
+        agentMenu.Opening += (_, e) =>
+        {
+            var agent = GetSelectedAgent();
+            if (agent == null)
+            {
+                e.Cancel = true;
+                return;
+            }
+
+            _miKick.Enabled = agent.Online;
+            _miKick.Text = agent.Online
+                ? $"Kick '{agent.Name}' (Ngắt kết nối)"
+                : $"'{agent.Name}' đang Offline";
+            _miKick.ForeColor = agent.Online ? DesignTokens.StatusDangerText : DesignTokens.TextMuted;
+
+            if (_compareKeyA != null && _server.Agents.TryGetValue(_compareKeyA, out var agentA) && _compareKeyA != agent.Key)
+            {
+                _miCompareWithA.Visible = true;
+                _miCompareWithA.Text = $"So sánh '{agent.Name}' với '{agentA.Name}'";
+            }
+            else
+            {
+                _miCompareWithA.Visible = false;
+            }
+        };
+
+        dgvAgents.ContextMenuStrip = agentMenu;
+    }
+
+    private void WireSettingsDrawer()
+    {
+        settingsDrawer.CloseRequested += () => ToggleSettingsDrawer(false);
+        settingsDrawer.SettingsChanged += s => ApplySettings(s, saveToDisk: true);
+        settingsDrawer.ExportCsvRequested += ExportAgentsToCsv;
+        settingsDrawer.ExportLogRequested += ExportLogsToTxt;
+        settingsDrawer.ToggleDemoAgentsRequested += ToggleDemoAgents;
+        settingsDrawer.ResetDefaultsRequested += () =>
+        {
+            _settings.ResetToDefaults();
+            ApplySettings(_settings, saveToDisk: true);
+            OnLogMessage($"[{DateTime.Now:HH:mm:ss}] [Cài đặt] Đã khôi phục cấu hình mặc định.");
+        };
+
+        configurePopover.ValuesChanged += (cpu, ram, disk, interval) =>
+        {
+            if (_syncingControls) return;
+            _settings.CpuLimit = cpu;
+            _settings.RamLimit = ram;
+            _settings.DiskLimit = disk;
+            _settings.ReportIntervalSeconds = interval;
+            ApplySettings(_settings, saveToDisk: true);
+        };
+        configurePopover.Closed += () => btnConfigure.Active = false;
+    }
+
     private void Form1_Load(object? sender, EventArgs e)
     {
         LayoutHeaderAndToolbar();
         if (splitBottom.Width > 200)
             splitBottom.SplitterDistance = (int)(splitBottom.Width * 0.48);
 
-        _server.ReportIntervalSeconds = (int)numInterval.Value;
+        _server.ReportIntervalSeconds = _settings.ReportIntervalSeconds;
         _server.Start();
         UpdateServerStatusUi();
-    }
-
-    // Căn chỉnh chính xác vị trí các nút và ô cấu hình ngưỡng theo chiều rộng thực tế của cửa sổ
-    private void LayoutHeaderAndToolbar()
-    {
-        int hw = pnlHeader.ClientSize.Width;
-        if (hw > 300)
-        {
-            btnToggleServer.Location = new Point(hw - btnToggleServer.Width - 16, 13);
-            btnRemoveOffline.Location = new Point(btnToggleServer.Left - btnRemoveOffline.Width - 10, 13);
-        }
-
-        int tw = pnlToolbar.ClientSize.Width;
-        if (tw > 600)
-        {
-            int right = tw - 16;
-
-            numInterval.Location = new Point(right - numInterval.Width, 12);
-            right = numInterval.Left - 6;
-            lblInterval.Location = new Point(right - lblInterval.PreferredWidth, 15);
-            right = lblInterval.Left - 14;
-
-            numDiskLimit.Location = new Point(right - numDiskLimit.Width, 12);
-            right = numDiskLimit.Left - 6;
-            lblDiskLimit.Location = new Point(right - lblDiskLimit.PreferredWidth, 15);
-            right = lblDiskLimit.Left - 14;
-
-            numRamLimit.Location = new Point(right - numRamLimit.Width, 12);
-            right = numRamLimit.Left - 6;
-            lblRamLimit.Location = new Point(right - lblRamLimit.PreferredWidth, 15);
-            right = lblRamLimit.Left - 14;
-
-            numCpuLimit.Location = new Point(right - numCpuLimit.Width, 12);
-            right = numCpuLimit.Left - 6;
-            lblCpuLimit.Location = new Point(right - lblCpuLimit.PreferredWidth, 15);
-        }
+        ApplyTitleBarTheme();
     }
 
     private void Form1_FormClosing(object? sender, FormClosingEventArgs e)
     {
+        if (!_allowExit && _settings.MinimizeToTray && e.CloseReason == CloseReason.UserClosing)
+        {
+            e.Cancel = true;
+            Hide();
+            trayIcon.ShowBalloonTip(2000, "LanMonitor Server",
+                "Server vẫn đang chạy ngầm và giám sát mạng LAN.", ToolTipIcon.Info);
+            return;
+        }
+
+        _demoCts?.Cancel();
         timerWatchdog.Stop();
         _server.Stop();
+        trayIcon.Visible = false;
     }
 
-    // Nhận sự kiện từ luồng mạng và đồng bộ về UI thread
+    private void RestoreFromTray()
+    {
+        Show();
+        if (WindowState == FormWindowState.Minimized)
+            WindowState = FormWindowState.Normal;
+        Activate();
+    }
+
+    // =========================================================================
+    // ÁP DỤNG THEME SÁNG / TỐI & CẤU HÌNH TOÀN CỤC
+    // =========================================================================
+    private void ApplySettings(AppSettings s, bool saveToDisk)
+    {
+        _settings = s;
+        bool isDark = DesignTokens.Resolve(s.Theme);
+        DesignTokens.Apply(isDark, s.AccentIndex);
+
+        _syncingControls = true;
+        configurePopover.LoadValues(s.CpuLimit, s.RamLimit, s.DiskLimit, s.ReportIntervalSeconds);
+        settingsDrawer.LoadFrom(s);
+        _syncingControls = false;
+
+        _server.ReportIntervalSeconds = s.ReportIntervalSeconds;
+        dgvAgents.RowTemplate.Height = s.CompactRows ? 34 : 42;
+        foreach (DataGridViewRow r in dgvAgents.Rows)
+            r.Height = dgvAgents.RowTemplate.Height;
+
+        ApplyThemeToControls();
+        if (IsHandleCreated) ApplyTitleBarTheme();
+
+        foreach (var agent in _server.Agents.Values)
+            UpdateOrCreateRow(agent);
+
+        ApplyFilter();
+        pnlHeader.Invalidate();
+        pnlFooter.Invalidate();
+        pnlToolbar.Invalidate();
+        pnlChartCanvas.Invalidate();
+
+        if (saveToDisk)
+            _settings.Save();
+    }
+
+    private void ApplyThemeToControls()
+    {
+        BackColor = DesignTokens.SurfaceCanvas;
+        pnlHeader.BackColor = DesignTokens.SurfaceHeader;
+        pnlToolbar.BackColor = DesignTokens.SurfaceSubtle;
+
+        searchBox.ApplyTheme();
+        segFilter.Invalidate();
+
+        splitMain.BackColor = DesignTokens.BorderStrong;
+        splitBottom.BackColor = DesignTokens.BorderStrong;
+
+        dgvAgents.BackgroundColor = DesignTokens.SurfaceCanvas;
+        dgvAgents.GridColor = DesignTokens.BorderSubtle;
+        dgvAgents.ColumnHeadersDefaultCellStyle.BackColor = DesignTokens.SurfaceElevated;
+        dgvAgents.ColumnHeadersDefaultCellStyle.ForeColor = DesignTokens.TextSecondary;
+
+        pnlChartContainer.BackColor = DesignTokens.SurfaceElevated;
+        pnlChartHeader.BackColor = DesignTokens.SurfaceSubtle;
+        lblChartTitle.ForeColor = DesignTokens.TextPrimary;
+        pnlChartCanvas.BackColor = DesignTokens.SurfaceElevated;
+
+        pnlLogHeader.BackColor = DesignTokens.SurfaceSubtle;
+        lblLogTitle.ForeColor = DesignTokens.TextPrimary;
+        lstLogs.BackColor = DesignTokens.SurfaceTerminal;
+        lstLogs.ForeColor = DesignTokens.TextOnDark;
+
+        pnlFooter.BackColor = DesignTokens.SurfaceSubtle;
+        agentMenu.BackColor = DesignTokens.SurfaceElevated;
+        agentMenu.ForeColor = DesignTokens.TextPrimary;
+
+        configurePopover.ApplyTheme();
+        settingsDrawer.ApplyTheme();
+        Invalidate(true);
+    }
+
+    private void ApplyTitleBarTheme()
+    {
+        try
+        {
+            int useDark = DesignTokens.IsDark ? 1 : 0;
+            // DWMWA_USE_IMMERSIVE_DARK_MODE = 20 (Windows 10 build 19041+ & Windows 11)
+            DwmSetWindowAttribute(Handle, 20, ref useDark, sizeof(int));
+        }
+        catch { }
+    }
+
+    private void LayoutHeaderAndToolbar()
+    {
+        int hw = pnlHeader.ClientSize.Width;
+        if (hw > 360)
+        {
+            btnSettings.Location = new Point(hw - btnSettings.Width - 16, 14);
+            btnToggleServer.Location = new Point(btnSettings.Left - btnToggleServer.Width - 10, 14);
+            btnRemoveOffline.Location = new Point(btnToggleServer.Left - btnRemoveOffline.Width - 10, 14);
+        }
+
+        int tw = pnlToolbar.ClientSize.Width;
+        if (tw > 400)
+        {
+            btnConfigure.Location = new Point(tw - btnConfigure.Width - 16, 9);
+            configurePopover.Location = new Point(
+                Math.Max(16, pnlToolbar.Left + btnConfigure.Right - configurePopover.Width),
+                pnlToolbar.Bottom);
+        }
+    }
+
+    // =========================================================================
+    // NHẬN DỮ LIỆU TỪ SERVER & CẬP NHẬT DASHBOARD
+    // =========================================================================
     private void OnAgentUpdated(AgentInfo agent)
     {
         if (IsDisposed) return;
@@ -99,10 +387,21 @@ public partial class Form1 : Form
             return;
         }
 
+        bool wasOnlineBefore = _rowsByKey.TryGetValue(agent.Key, out var existingRow)
+            && existingRow.Cells["colStatus"].Value?.ToString() == "Online";
+
         UpdateOrCreateRow(agent);
         CheckAndLogThresholdAlert(agent);
+
+        if (wasOnlineBefore && !agent.Online && _settings.NotifyOnOffline)
+        {
+            trayIcon.ShowBalloonTip(3000, "Máy trạm mất kết nối",
+                $"Máy '{agent.Name}' ({agent.Ip}) đã chuyển sang Offline.", ToolTipIcon.Warning);
+        }
+
         ApplyFilter();
         pnlHeader.Invalidate();
+        pnlFooter.Invalidate();
 
         if (GetSelectedAgent()?.Key == agent.Key || dgvAgents.Rows.Count == 1)
         {
@@ -128,13 +427,13 @@ public partial class Form1 : Form
         lstLogs.TopIndex = lstLogs.Items.Count - 1;
     }
 
-    // Cập nhật hoặc thêm mới 1 dòng trên bảng Dashboard
     private void UpdateOrCreateRow(AgentInfo agent)
     {
         if (!_rowsByKey.TryGetValue(agent.Key, out var row))
         {
             int idx = dgvAgents.Rows.Add();
             row = dgvAgents.Rows[idx];
+            row.Height = dgvAgents.RowTemplate.Height;
             row.Tag = agent;
             _rowsByKey[agent.Key] = row;
         }
@@ -151,16 +450,15 @@ public partial class Form1 : Form
         row.Cells["colAlert"].Value = agent.GetAlertText(CpuLimit, RamLimit, DiskLimit);
         row.Cells["colLastSeen"].Value = agent.LastSeen.ToString("HH:mm:ss");
 
-        // Sử dụng шрифт Tabular cho cột IP và thời gian (quy tắc number-tabular)
         row.Cells["colIp"].Style.Font = DesignTokens.FontTabular;
         row.Cells["colLastSeen"].Style.Font = DesignTokens.FontTabular;
         row.Cells["colName"].Style.Font = DesignTokens.FontBodyStrong;
 
         if (!agent.Online)
         {
-            row.DefaultCellStyle.BackColor = DesignTokens.SurfaceSubtle;
+            row.DefaultCellStyle.BackColor = DesignTokens.OfflineRowBg;
             row.DefaultCellStyle.ForeColor = DesignTokens.TextMuted;
-            row.DefaultCellStyle.SelectionBackColor = Color.FromArgb(226, 232, 240);
+            row.DefaultCellStyle.SelectionBackColor = DesignTokens.SurfaceSubtle;
             row.DefaultCellStyle.SelectionForeColor = DesignTokens.TextSecondary;
             row.Cells["colAlert"].Style.ForeColor = DesignTokens.TextMuted;
             row.Cells["colAlert"].Style.Font = DesignTokens.FontBody;
@@ -169,7 +467,7 @@ public partial class Form1 : Form
         {
             row.DefaultCellStyle.BackColor = DesignTokens.StatusDangerRowBg;
             row.DefaultCellStyle.ForeColor = DesignTokens.TextPrimary;
-            row.DefaultCellStyle.SelectionBackColor = Color.FromArgb(254, 226, 226);
+            row.DefaultCellStyle.SelectionBackColor = DesignTokens.StatusDangerBg;
             row.DefaultCellStyle.SelectionForeColor = DesignTokens.StatusDangerText;
             row.Cells["colAlert"].Style.ForeColor = DesignTokens.StatusDangerText;
             row.Cells["colAlert"].Style.Font = DesignTokens.FontBodyStrong;
@@ -187,11 +485,10 @@ public partial class Form1 : Form
         dgvAgents.InvalidateRow(row.Index);
     }
 
-    // Lọc danh sách máy theo ô Tìm kiếm và ComboBox trạng thái
     private void ApplyFilter()
     {
-        string query = txtSearch.Text.Trim();
-        int mode = cboFilter.SelectedIndex; // 0: Tất cả, 1: Online, 2: Vượt ngưỡng, 3: Offline
+        string query = searchBox.SearchText.Trim();
+        int mode = segFilter.SelectedIndex;
 
         foreach (DataGridViewRow row in dgvAgents.Rows)
         {
@@ -223,67 +520,73 @@ public partial class Form1 : Form
         {
             string alertText = agent.GetAlertText(CpuLimit, RamLimit, DiskLimit);
             OnLogMessage($"[{DateTime.Now:HH:mm:ss}] [CẢNH BÁO] Máy '{agent.Name}' ({agent.Ip}) -> {alertText}");
+
+            if (_settings.NotifyOnThreshold)
+            {
+                trayIcon.ShowBalloonTip(3500, $"Cảnh báo vượt ngưỡng — {agent.Name}",
+                    $"{agent.Ip}: {alertText}", ToolTipIcon.Warning);
+            }
+            if (_settings.SoundAlert)
+                SystemSounds.Exclamation.Play();
         }
         agent.WasAlerting = isAlert;
     }
 
     // =========================================================================
-    // 1. VẼ THANH COMMAND HEADER (NOC TELEMETRY RIBBON)
+    // VẼ HEADER, BẢNG DỮ LIỆU, BIỂU ĐỒ & CONSOLE
     // =========================================================================
     private void pnlHeader_Paint(object? sender, PaintEventArgs e)
     {
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
 
-        // Vẽ biểu tượng mạng Vector (3 nút kết nối) thay vì dùng emoji
-        Rectangle iconRect = new(16, 15, 30, 30);
+        Rectangle iconRect = new(16, 16, 30, 30);
         using (var accentBrush = new SolidBrush(DesignTokens.AccentPrimary))
-        using (var pen = new Pen(Color.White, 1.8f))
+        using (var pen = new Pen(DesignTokens.AccentForeground, 1.8f))
+        using (var dotBrush = new SolidBrush(DesignTokens.AccentForeground))
         {
-            using var path = CreateRoundedRect(iconRect, 7);
+            using var path = GraphicsExtensions.CreateRoundedRect(iconRect, 8);
             g.FillPath(accentBrush, path);
 
-            // Vẽ 3 đỉnh mạng bên trong icon
             Point pTop = new(iconRect.X + 15, iconRect.Y + 8);
             Point pLeft = new(iconRect.X + 8, iconRect.Y + 21);
             Point pRight = new(iconRect.X + 22, iconRect.Y + 21);
             g.DrawLine(pen, pTop, pLeft);
             g.DrawLine(pen, pTop, pRight);
             g.DrawLine(pen, pLeft, pRight);
-            g.FillEllipse(Brushes.White, pTop.X - 2, pTop.Y - 2, 5, 5);
-            g.FillEllipse(Brushes.White, pLeft.X - 2, pLeft.Y - 2, 5, 5);
-            g.FillEllipse(Brushes.White, pRight.X - 2, pRight.Y - 2, 5, 5);
+            g.FillEllipse(dotBrush, pTop.X - 2, pTop.Y - 2, 5, 5);
+            g.FillEllipse(dotBrush, pLeft.X - 2, pLeft.Y - 2, 5, 5);
+            g.FillEllipse(dotBrush, pRight.X - 2, pRight.Y - 2, 5, 5);
         }
 
-        // Tiêu đề hệ thống
         TextRenderer.DrawText(
             g, "LAN MONITOR",
             DesignTokens.FontHeading,
-            new Point(54, 10),
-            DesignTokens.TextOnDark);
+            new Point(54, 11),
+            DesignTokens.TextOnDark,
+            TextFormatFlags.NoPrefix);
 
-        // Huy hiệu trạng thái Server (Pill Badge)
         bool running = _server.IsRunning;
-        string statusText = running
-            ? $"ĐANG LẮNG NGHE · TCP {Protocol.TcpPort} · UDP {Protocol.UdpPort}"
-            : "SERVER ĐÃ TẠM DỪNG";
+        string statusText = running ? "ONLINE" : "OFFLINE";
 
         Color dotColor = running ? Color.FromArgb(34, 197, 94) : DesignTokens.StatusOfflineDot;
-        g.FillEllipse(new SolidBrush(dotColor), 58, 37, 8, 8);
+        using (var statusBrush = new SolidBrush(dotColor))
+            g.FillEllipse(statusBrush, 58, 38, 8, 8);
+
         TextRenderer.DrawText(
             g, statusText,
-            DesignTokens.FontLabel,
-            new Point(70, 33),
-            running ? Color.FromArgb(134, 239, 172) : DesignTokens.TextOnDarkMuted);
+            DesignTokens.FontBadge,
+            new Point(70, 34),
+            running ? Color.FromArgb(134, 239, 172) : DesignTokens.TextOnDarkMuted,
+            TextFormatFlags.NoPrefix);
 
-        // Dải thống kê Inline Telemetry (Tabular Numerals)
         var all = _server.Agents.Values.ToList();
         int total = all.Count;
         int online = all.Count(a => a.Online);
         int offline = total - online;
         int alerting = all.Count(a => a.IsAlerting(CpuLimit, RamLimit, DiskLimit));
 
-        int startX = 360;
+        int startX = 355;
         DrawTelemetryMetric(g, ref startX, "TỔNG MÁY", total.ToString(), DesignTokens.TextOnDark);
         DrawTelemetryMetric(g, ref startX, "ONLINE", online.ToString(), Color.FromArgb(74, 222, 128));
         DrawTelemetryMetric(g, ref startX, "OFFLINE", offline.ToString(), DesignTokens.TextOnDarkMuted);
@@ -294,12 +597,12 @@ public partial class Form1 : Form
     private static void DrawTelemetryMetric(Graphics g, ref int x, string label, string value, Color valueColor)
     {
         using var divPen = new Pen(DesignTokens.BorderDark, 1);
-        g.DrawLine(divPen, x, 14, x, 46);
+        g.DrawLine(divPen, x, 15, x, 47);
         x += 16;
 
-        TextRenderer.DrawText(g, label, DesignTokens.FontLabel, new Point(x, 12), DesignTokens.TextOnDarkMuted);
-        TextRenderer.DrawText(g, value, DesignTokens.FontHeading, new Point(x, 27), valueColor);
-        x += 105;
+        TextRenderer.DrawText(g, label, DesignTokens.FontLabel, new Point(x, 12), DesignTokens.TextOnDarkMuted, TextFormatFlags.NoPrefix);
+        TextRenderer.DrawText(g, value, DesignTokens.FontHeading, new Point(x, 28), valueColor, TextFormatFlags.NoPrefix);
+        x += 104;
     }
 
     private void pnlToolbar_Paint(object? sender, PaintEventArgs e)
@@ -315,14 +618,10 @@ public partial class Form1 : Form
         e.Graphics.DrawLine(pen, 0, c.Height - 1, c.Width, c.Height - 1);
     }
 
-    // =========================================================================
-    // 2. VẼ BẢNG DỮ LIỆU & EMPTY STATE (OPERATE MODE + WCAG COLOR-NOT-ONLY)
-    // =========================================================================
     private void dgvAgents_CellPainting(object? sender, DataGridViewCellPaintingEventArgs e)
     {
         if (e.Graphics == null) return;
 
-        // Vẽ Header bảng với đường kẻ phân cách tinh tế
         if (e.RowIndex == -1 && e.ColumnIndex >= 0)
         {
             e.PaintBackground(e.ClipBounds, false);
@@ -336,7 +635,7 @@ public partial class Form1 : Form
                 DesignTokens.FontSection,
                 textRect,
                 DesignTokens.TextSecondary,
-                TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
+                TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
 
             e.Handled = true;
             return;
@@ -347,23 +646,21 @@ public partial class Form1 : Form
 
         string colName = dgvAgents.Columns[e.ColumnIndex].Name;
 
-        // A. Vẽ Huy hiệu Trạng thái (Status Pill Badge có chấm Vector)
         if (colName == "colStatus")
         {
             e.PaintBackground(e.ClipBounds, true);
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
 
-            Rectangle pillRect = new(e.CellBounds.X + 8, e.CellBounds.Y + 9, 78, 24);
+            int pillY = e.CellBounds.Y + Math.Max(4, (e.CellBounds.Height - 24) / 2);
+            Rectangle pillRect = new(e.CellBounds.X + 8, pillY, 78, 24);
             Color bg = agent.Online ? DesignTokens.StatusOnlineBg : DesignTokens.StatusOfflineBg;
             Color fg = agent.Online ? DesignTokens.StatusOnlineText : DesignTokens.StatusOfflineText;
             Color dot = agent.Online ? DesignTokens.StatusOnlineDot : DesignTokens.StatusOfflineDot;
 
-            using (var path = CreateRoundedRect(pillRect, 12))
+            using (var path = GraphicsExtensions.CreateRoundedRect(pillRect, 12))
             using (var brush = new SolidBrush(bg))
-            {
                 g.FillPath(brush, path);
-            }
 
             if (agent.Online)
             {
@@ -382,13 +679,12 @@ public partial class Form1 : Form
                 DesignTokens.FontBadge,
                 new Rectangle(pillRect.X + 22, pillRect.Y, pillRect.Width - 24, pillRect.Height),
                 fg,
-                TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
+                TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPrefix);
 
             e.Handled = true;
             return;
         }
 
-        // B. Vẽ thanh đo mức sử dụng CPU / RAM / Disk
         if (colName is "colCpu" or "colRam" or "colDisk")
         {
             if (!agent.Online) return;
@@ -410,64 +706,60 @@ public partial class Form1 : Form
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
 
+            int barH = Math.Min(22, Math.Max(14, e.CellBounds.Height - 16));
+            int barY = e.CellBounds.Y + (e.CellBounds.Height - barH) / 2;
             Rectangle barBounds = new(
                 e.CellBounds.X + 8,
-                e.CellBounds.Y + 9,
+                barY,
                 Math.Max(0, e.CellBounds.Width - 16),
-                Math.Max(0, e.CellBounds.Height - 18));
+                barH);
 
-            if (barBounds.Width > 20 && barBounds.Height > 8)
+            if (barBounds.Width > 20)
             {
                 bool isDanger = value >= limit;
                 bool isWarn = !isDanger && value >= limit - 15;
 
                 Color trackColor = isDanger
                     ? DesignTokens.StatusDangerBg
-                    : isWarn ? DesignTokens.StatusWarningBg : DesignTokens.SurfaceSubtle;
+                    : isWarn ? DesignTokens.StatusWarningBg : DesignTokens.MeterTrack;
 
                 Color fillColor = isDanger
                     ? DesignTokens.StatusDangerBar
                     : isWarn ? DesignTokens.StatusWarningBar : DesignTokens.AccentPrimary;
 
-                using (var trackPath = CreateRoundedRect(barBounds, 5))
+                using (var trackPath = GraphicsExtensions.CreateRoundedRect(barBounds, 5))
                 using (var trackBrush = new SolidBrush(trackColor))
-                {
                     g.FillPath(trackBrush, trackPath);
-                }
 
                 int fillWidth = (int)Math.Round(barBounds.Width * (Math.Clamp(value, 0, 100) / 100.0));
                 if (fillWidth > 4)
                 {
                     Rectangle fillRect = new(barBounds.X, barBounds.Y, fillWidth, barBounds.Height);
-                    using var fillPath = CreateRoundedRect(fillRect, 5);
+                    using var fillPath = GraphicsExtensions.CreateRoundedRect(fillRect, 5);
                     using var fillBrush = new SolidBrush(fillColor);
                     g.FillPath(fillBrush, fillPath);
                 }
 
-                using (var borderPath = CreateRoundedRect(barBounds, 5))
-                using (var borderPen = new Pen(isDanger ? Color.FromArgb(252, 165, 165) : DesignTokens.BorderStrong))
-                {
+                using (var borderPath = GraphicsExtensions.CreateRoundedRect(barBounds, 5))
+                using (var borderPen = new Pen(isDanger ? DesignTokens.StatusDangerBar : DesignTokens.BorderStrong))
                     g.DrawPath(borderPen, borderPath);
-                }
 
-                // Thêm ký hiệu [!] khi vượt ngưỡng để không chỉ phụ thuộc vào màu sắc (quy tắc color-not-only)
                 string label = isDanger ? $"{value}% [!]" : $"{value}%";
-                Color textColor = fillWidth > barBounds.Width / 2 ? Color.White : DesignTokens.TextPrimary;
+                Color textColor = fillWidth > barBounds.Width / 2
+                    ? (isDanger || !DesignTokens.IsDark ? Color.White : DesignTokens.AccentForeground)
+                    : DesignTokens.TextPrimary;
 
                 TextRenderer.DrawText(
-                    g,
-                    label,
+                    g, label,
                     isDanger ? DesignTokens.FontTabularBold : DesignTokens.FontTabular,
-                    barBounds,
-                    textColor,
-                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                    barBounds, textColor,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
             }
 
             e.Handled = true;
         }
     }
 
-    // Vẽ Empty State hướng dẫn rõ ràng khi chưa có máy nào kết nối
     private void dgvAgents_Paint(object? sender, PaintEventArgs e)
     {
         bool anyVisible = dgvAgents.Rows.Cast<DataGridViewRow>().Any(r => r.Visible);
@@ -482,7 +774,7 @@ public partial class Form1 : Form
         int cardY = Math.Max(55, (dgvAgents.Height - cardH) / 2);
 
         Rectangle cardRect = new(cardX, cardY, cardW, cardH);
-        using (var path = CreateRoundedRect(cardRect, 10))
+        using (var path = GraphicsExtensions.CreateRoundedRect(cardRect, 10))
         using (var bgBrush = new SolidBrush(DesignTokens.SurfaceElevated))
         using (var borderPen = new Pen(DesignTokens.BorderStrong, 1))
         {
@@ -495,11 +787,11 @@ public partial class Form1 : Form
             : "Không có máy trạm nào khớp với bộ lọc hiện tại";
 
         string desc = _server.Agents.IsEmpty
-            ? $"Khởi chạy LanMonitor.Agent trên các máy cần giám sát. Agent sẽ tự động tìm Server\nqua UDP Broadcast (cổng {Protocol.UdpPort}) và gửi thông số về cổng TCP {Protocol.TcpPort}."
+            ? $"Khởi chạy LanMonitor.Agent trên các máy cần giám sát, hoặc bấm nút Bánh răng (⚙)\ngóc trên phải để mở Cài đặt và dùng thử chế độ Mô phỏng máy trạm ảo."
             : "Hãy xóa từ khóa tìm kiếm hoặc chuyển bộ lọc hiển thị về 'Tất cả máy'.";
 
         string cmdHint = _server.Agents.IsEmpty
-            ? "Lệnh chạy thử:  dotnet run --project LanMonitor.Agent"
+            ? "Lệnh chạy Agent:  dotnet run --project LanMonitor.Agent"
             : "";
 
         TextRenderer.DrawText(
@@ -518,7 +810,7 @@ public partial class Form1 : Form
         {
             Rectangle codeRect = new(cardX + 36, cardY + 98, cardW - 72, 32);
             using var codeBrush = new SolidBrush(DesignTokens.SurfaceSubtle);
-            using var codePath = CreateRoundedRect(codeRect, 6);
+            using var codePath = GraphicsExtensions.CreateRoundedRect(codeRect, 6);
             g.FillPath(codeBrush, codePath);
 
             TextRenderer.DrawText(
@@ -528,9 +820,6 @@ public partial class Form1 : Form
         }
     }
 
-    // =========================================================================
-    // 3. BIỂU ĐỒ XU HƯỚNG THỜI GIAN THỰC (CHART & DATA RULES)
-    // =========================================================================
     private AgentInfo? GetSelectedAgent()
     {
         if (dgvAgents.SelectedRows.Count > 0 && dgvAgents.SelectedRows[0].Tag is AgentInfo selected)
@@ -544,6 +833,60 @@ public partial class Form1 : Form
     {
         UpdateChartHeader();
         pnlChartCanvas.Invalidate();
+    }
+
+    private void dgvAgents_CellMouseDown(object? sender, DataGridViewCellMouseEventArgs e)
+    {
+        if (e.Button == MouseButtons.Right && e.RowIndex >= 0 && e.RowIndex < dgvAgents.Rows.Count)
+        {
+            dgvAgents.ClearSelection();
+            dgvAgents.Rows[e.RowIndex].Selected = true;
+        }
+    }
+
+    private void dgvAgents_CellMouseEnter(object? sender, DataGridViewCellEventArgs e)
+    {
+        if (e.RowIndex != _hoveredRowIndex)
+        {
+            _hoveredRowIndex = e.RowIndex;
+            if (e.RowIndex >= 0) dgvAgents.InvalidateRow(e.RowIndex);
+        }
+    }
+
+    private void dgvAgents_CellMouseLeave(object? sender, DataGridViewCellEventArgs e)
+    {
+        if (_hoveredRowIndex >= 0)
+        {
+            int prev = _hoveredRowIndex;
+            _hoveredRowIndex = -1;
+            if (prev < dgvAgents.Rows.Count) dgvAgents.InvalidateRow(prev);
+        }
+    }
+
+    private void pnlFooter_Paint(object? sender, PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        using var topPen = new Pen(DesignTokens.BorderStrong, 1);
+        g.DrawLine(topPen, 0, 0, pnlFooter.Width, 0);
+
+        var online = _server.Agents.Values.Where(a => a.Online).ToList();
+        string leftText;
+        if (online.Count > 0)
+        {
+            double avgCpu = online.Average(a => a.Cpu);
+            double avgRam = online.Average(a => a.Ram);
+            var hottest = online.OrderByDescending(a => a.Cpu + a.Ram).First();
+            leftText = $"Trung bình LAN ({online.Count} máy Online):  CPU {avgCpu:F0}%  ·  RAM {avgRam:F0}%   |   Tải cao nhất: {hottest.Name} (CPU {hottest.Cpu}%, RAM {hottest.Ram}%)";
+        }
+        else
+        {
+            leftText = "Chưa có máy trạm Online trong mạng LAN";
+        }
+
+        TextRenderer.DrawText(g, leftText, DesignTokens.FontLabel,
+            new Rectangle(14, 0, pnlFooter.Width - 28, pnlFooter.Height),
+            DesignTokens.TextSecondary,
+            TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
     }
 
     private void UpdateChartHeader()
@@ -576,25 +919,25 @@ public partial class Form1 : Form
             return;
         }
 
-        int padLeft = 44, padRight = 18, padTop = 34, padBottom = 26;
+        int padLeft = 44, padRight = 18, padTop = 34, padBottom = 24;
         Rectangle plot = new(padLeft, padTop, Math.Max(10, w - padLeft - padRight), Math.Max(10, h - padTop - padBottom));
 
-        // Vẽ chú giải (Legend) phía trên biểu đồ (quy tắc legend-visible)
         Color cpuColor = DesignTokens.AccentPrimary;
-        Color ramColor = Color.FromArgb(16, 185, 129); // Emerald 500
+        Color ramColor = DesignTokens.ChartRam;
 
         using (var cpuBrush = new SolidBrush(cpuColor))
         using (var ramBrush = new SolidBrush(ramColor))
         {
             g.FillRectangle(cpuBrush, padLeft, 10, 12, 12);
-            TextRenderer.DrawText(g, $"CPU hiện tại: {agent.Cpu}% (Ngưỡng {CpuLimit}%)", DesignTokens.FontLabel, new Point(padLeft + 16, 8), DesignTokens.TextPrimary);
+            TextRenderer.DrawText(g, $"CPU: {agent.Cpu}% (Ngưỡng {CpuLimit}%)", DesignTokens.FontLabel,
+                new Point(padLeft + 16, 8), DesignTokens.TextPrimary, TextFormatFlags.NoPrefix);
 
-            int ramLegendX = padLeft + 210;
+            int ramLegendX = padLeft + 195;
             g.FillRectangle(ramBrush, ramLegendX, 10, 12, 12);
-            TextRenderer.DrawText(g, $"RAM hiện tại: {agent.Ram}% (Ngưỡng {RamLimit}%)", DesignTokens.FontLabel, new Point(ramLegendX + 16, 8), DesignTokens.TextPrimary);
+            TextRenderer.DrawText(g, $"RAM: {agent.Ram}% (Ngưỡng {RamLimit}%)", DesignTokens.FontLabel,
+                new Point(ramLegendX + 16, 8), DesignTokens.TextPrimary, TextFormatFlags.NoPrefix);
         }
 
-        // Vẽ lưới ngang (gridline-subtle) và nhãn trục Y (axis-labels)
         using var gridPen = new Pen(DesignTokens.BorderSubtle, 1);
         int[] ticks = { 0, 25, 50, 75, 100 };
         foreach (int t in ticks)
@@ -605,13 +948,16 @@ public partial class Form1 : Form
                 g, $"{t}%", DesignTokens.FontTabular,
                 new Rectangle(2, y - 8, padLeft - 6, 16),
                 DesignTokens.TextMuted,
-                TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
+                TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
         }
 
-        // Đường ngưỡng cảnh báo CPU (nét đứt)
-        int limitY = plot.Bottom - (int)Math.Round(plot.Height * (CpuLimit / 100.0));
-        using (var limitPen = new Pen(Color.FromArgb(180, 220, 38, 38), 1) { DashStyle = DashStyle.Dash })
+        if (_settings.ShowThresholdLineOnChart)
         {
+            int limitY = plot.Bottom - (int)Math.Round(plot.Height * (CpuLimit / 100.0));
+            using var limitPen = new Pen(Color.FromArgb(190, DesignTokens.StatusDangerBar), 1.2f)
+            {
+                DashStyle = DashStyle.Dash
+            };
             g.DrawLine(limitPen, plot.Left, limitY, plot.Right, limitY);
         }
 
@@ -623,8 +969,8 @@ public partial class Form1 : Form
             ramPoints = agent.RamHistory.ToList();
         }
 
-        DrawSeries(g, plot, cpuPoints, cpuColor, fillAlpha: 28);
-        DrawSeries(g, plot, ramPoints, ramColor, fillAlpha: 20);
+        DrawSeries(g, plot, cpuPoints, cpuColor, fillAlpha: DesignTokens.IsDark ? 42 : 28);
+        DrawSeries(g, plot, ramPoints, ramColor, fillAlpha: DesignTokens.IsDark ? 32 : 20);
 
         using var borderPen = new Pen(DesignTokens.BorderStrong, 1);
         g.DrawRectangle(borderPen, plot);
@@ -661,15 +1007,11 @@ public partial class Form1 : Form
             g.DrawLines(linePen, pts.ToArray());
         }
 
-        // Vẽ điểm mẫu mới nhất
         var last = pts[^1];
         using var dotBrush = new SolidBrush(color);
         g.FillEllipse(dotBrush, last.X - 3.5f, last.Y - 3.5f, 7f, 7f);
     }
 
-    // =========================================================================
-    // 4. VẼ NHẬT KÝ SỰ KIỆN MẠNG VỚI PHÂN LOẠI MÀU NGỮ NGHĨA
-    // =========================================================================
     private void lstLogs_DrawItem(object? sender, DrawItemEventArgs e)
     {
         if (e.Index < 0 || e.Index >= lstLogs.Items.Count) return;
@@ -679,18 +1021,16 @@ public partial class Form1 : Form
 
         Color fg = DesignTokens.TextOnDark;
         if (text.Contains("[CẢNH BÁO]") || text.Contains("[Lỗi"))
-            fg = Color.FromArgb(252, 165, 165); // Red 300
+            fg = Color.FromArgb(252, 165, 165);
         else if (text.Contains("[Timeout]") || text.Contains("[-]"))
-            fg = Color.FromArgb(253, 224, 71);  // Yellow 300
+            fg = Color.FromArgb(253, 224, 71);
         else if (text.Contains("[+]"))
-            fg = Color.FromArgb(134, 239, 172); // Green 300
+            fg = Color.FromArgb(134, 239, 172);
         else if (text.Contains("[UDP]"))
-            fg = Color.FromArgb(147, 197, 253); // Blue 300
+            fg = Color.FromArgb(147, 197, 253);
 
         TextRenderer.DrawText(
-            e.Graphics,
-            text,
-            DesignTokens.FontTabular,
+            e.Graphics, text, DesignTokens.FontTabular,
             new Rectangle(e.Bounds.X + 8, e.Bounds.Y, e.Bounds.Width - 12, e.Bounds.Height),
             fg,
             TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPrefix);
@@ -699,8 +1039,25 @@ public partial class Form1 : Form
     }
 
     // =========================================================================
-    // 5. SỰ KIỆN ĐIỀU KHIỂN
+    // SỰ KIỆN TƯƠNG TÁC, SETTINGS DRAWER, EXPORT & MÔ PHỎNG MÁY TRẠM
     // =========================================================================
+    private void btnSettings_Click(object? sender, EventArgs e) =>
+        ToggleSettingsDrawer(!settingsDrawer.Visible);
+
+    private void ToggleSettingsDrawer(bool open)
+    {
+        settingsDrawer.AnimateOpen(open);
+        btnSettings.Active = open;
+    }
+
+    private void btnConfigure_Click(object? sender, EventArgs e)
+    {
+        bool open = !btnConfigure.Active;
+        btnConfigure.Active = open;
+        LayoutHeaderAndToolbar();
+        configurePopover.AnimateToggle(open);
+    }
+
     private void btnToggleServer_Click(object? sender, EventArgs e)
     {
         if (_server.IsRunning)
@@ -716,13 +1073,14 @@ public partial class Form1 : Form
         if (_server.IsRunning)
         {
             btnToggleServer.Text = "Dừng Server";
-            btnToggleServer.BackColor = DesignTokens.StatusDangerBar;
+            btnToggleServer.Tone = ButtonTone.Danger;
         }
         else
         {
             btnToggleServer.Text = "Khởi động Server";
-            btnToggleServer.BackColor = DesignTokens.StatusOnlineDot;
+            btnToggleServer.Tone = ButtonTone.Primary;
         }
+        btnToggleServer.Invalidate();
         pnlHeader.Invalidate();
     }
 
@@ -744,8 +1102,101 @@ public partial class Form1 : Form
         }
 
         pnlHeader.Invalidate();
+        pnlFooter.Invalidate();
         pnlChartCanvas.Invalidate();
         dgvAgents.Invalidate();
+    }
+
+    private void btnCompare_Click(object? sender, EventArgs e)
+    {
+        var sel = GetSelectedAgent();
+        OpenCompareDialog(_compareKeyA ?? sel?.Key, _compareKeyA != null ? sel?.Key : null);
+    }
+
+    private void OpenCompareDialog(string? keyA, string? keyB)
+    {
+        if (_compareForm == null || _compareForm.IsDisposed)
+        {
+            _compareForm = new CompareForm(_server, _settings, keyA, keyB);
+            _compareForm.Show(this);
+        }
+        else
+        {
+            _compareForm.SelectMachines(keyA, keyB);
+            _compareForm.Activate();
+        }
+    }
+
+    private void KickSelectedAgent(AgentInfo agent)
+    {
+        var result = MessageBox.Show(
+            this,
+            $"Bạn có chắc muốn Kick (ngắt kết nối) máy '{agent.Name}' ({agent.Ip}) không?",
+            "Xác nhận Kick máy trạm",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning);
+
+        if (result != DialogResult.Yes) return;
+
+        // Nếu là máy ảo Demo thì hủy luôn task gửi của máy đó để nó chuyển Offline hẳn
+        if (_demoAgentCts.TryRemove(agent.Key, out var demoCts))
+        {
+            demoCts.Cancel();
+            demoCts.Dispose();
+        }
+
+        _server.KickAgent(agent.Key);
+        pnlHeader.Invalidate();
+        pnlFooter.Invalidate();
+    }
+
+    private void RemoveSingleAgent(AgentInfo agent)
+    {
+        if (_demoAgentCts.TryRemove(agent.Key, out var demoCts))
+        {
+            demoCts.Cancel();
+            demoCts.Dispose();
+        }
+
+        if (agent.Online)
+            _server.KickAgent(agent.Key);
+
+        _server.Agents.TryRemove(agent.Key, out _);
+        if (_rowsByKey.TryGetValue(agent.Key, out var row))
+        {
+            dgvAgents.Rows.Remove(row);
+            _rowsByKey.Remove(agent.Key);
+        }
+
+        pnlHeader.Invalidate();
+        pnlFooter.Invalidate();
+        pnlChartCanvas.Invalidate();
+        dgvAgents.Invalidate();
+    }
+
+    private async Task PingAgentAsync(AgentInfo agent)
+    {
+        try
+        {
+            using var ping = new Ping();
+            string target = agent.Ip == "unknown" ? "127.0.0.1" : agent.Ip;
+            var reply = await ping.SendPingAsync(target, 1500);
+
+            if (reply.Status == IPStatus.Success)
+            {
+                agent.LastPingMs = reply.RoundtripTime;
+                OnLogMessage($"[{DateTime.Now:HH:mm:ss}] [Ping] '{agent.Name}' ({target}) phản hồi: {reply.RoundtripTime} ms (TTL={reply.Options?.Ttl ?? 0}).");
+            }
+            else
+            {
+                agent.LastPingMs = null;
+                OnLogMessage($"[{DateTime.Now:HH:mm:ss}] [Ping] '{agent.Name}' ({target}) thất bại: {reply.Status}.");
+            }
+        }
+        catch (Exception ex)
+        {
+            OnLogMessage($"[{DateTime.Now:HH:mm:ss}] [Ping] Lỗi kiểm tra '{agent.Name}': {ex.Message}");
+        }
     }
 
     private void btnClearLog_Click(object? sender, EventArgs e) =>
@@ -754,43 +1205,197 @@ public partial class Form1 : Form
     private void Filter_Changed(object? sender, EventArgs e) =>
         ApplyFilter();
 
-    private void Threshold_ValueChanged(object? sender, EventArgs e)
-    {
-        foreach (var agent in _server.Agents.Values)
-            UpdateOrCreateRow(agent);
-
-        ApplyFilter();
-        pnlHeader.Invalidate();
-        pnlChartCanvas.Invalidate();
-    }
-
-    private void numInterval_ValueChanged(object? sender, EventArgs e)
-    {
-        _server.ReportIntervalSeconds = (int)numInterval.Value;
-    }
-
     private void timerWatchdog_Tick(object? sender, EventArgs e)
     {
         if (!_server.IsRunning) return;
-        int timeoutSeconds = Math.Max(10, _server.ReportIntervalSeconds * 3 + 2);
+        int timeoutSeconds = Math.Max(8, _settings.ReportIntervalSeconds * _settings.OfflineTimeoutMultiplier + 2);
         _server.CheckTimeouts(timeoutSeconds);
     }
 
-    private static GraphicsPath CreateRoundedRect(Rectangle bounds, int radius)
+    private void ExportAgentsToCsv()
     {
-        int d = radius * 2;
-        var path = new GraphicsPath();
-        if (radius <= 0 || bounds.Width < d || bounds.Height < d)
+        using var sfd = new SaveFileDialog
         {
-            path.AddRectangle(bounds);
-            return path;
+            Filter = "CSV File (*.csv)|*.csv",
+            FileName = $"LanMonitor_Agents_{DateTime.Now:yyyyMMdd_HHmmss}.csv"
+        };
+        if (sfd.ShowDialog(this) != DialogResult.OK) return;
+
+        var sb = new StringBuilder();
+        sb.AppendLine("TrangThai,TenMay,DiaChiIP,HeDieuHanh,CPU_%,RAM_%,Disk_%,CanhBao,CapNhatLuc");
+        foreach (var a in _server.Agents.Values.OrderByDescending(x => x.Online).ThenBy(x => x.Name))
+        {
+            string alert = a.GetAlertText(CpuLimit, RamLimit, DiskLimit).Replace(",", ";");
+            string os = a.Os.Replace(",", " ");
+            sb.AppendLine($"{(a.Online ? "Online" : "Offline")},{a.Name},{a.Ip},{os},{a.Cpu},{a.Ram},{a.Disk},{alert},{a.LastSeen:yyyy-MM-dd HH:mm:ss}");
         }
 
-        path.AddArc(bounds.X, bounds.Y, d, d, 180, 90);
-        path.AddArc(bounds.Right - d, bounds.Y, d, d, 270, 90);
-        path.AddArc(bounds.Right - d, bounds.Bottom - d, d, d, 0, 90);
-        path.AddArc(bounds.X, bounds.Bottom - d, d, d, 90, 90);
-        path.CloseFigure();
-        return path;
+        File.WriteAllText(sfd.FileName, sb.ToString(), new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+        OnLogMessage($"[{DateTime.Now:HH:mm:ss}] [Xuất dữ liệu] Đã lưu báo cáo CSV tại: {sfd.FileName}");
+    }
+
+    private void ExportLogsToTxt()
+    {
+        using var sfd = new SaveFileDialog
+        {
+            Filter = "Text File (*.txt)|*.txt",
+            FileName = $"LanMonitor_Logs_{DateTime.Now:yyyyMMdd_HHmmss}.txt"
+        };
+        if (sfd.ShowDialog(this) != DialogResult.OK) return;
+
+        var lines = lstLogs.Items.Cast<object>().Select(x => x.ToString() ?? "");
+        File.WriteAllLines(sfd.FileName, lines, Encoding.UTF8);
+        OnLogMessage($"[{DateTime.Now:HH:mm:ss}] [Xuất dữ liệu] Đã lưu nhật ký sự kiện tại: {sfd.FileName}");
+    }
+
+    // Mở cửa sổ cấu hình mô phỏng máy trạm ảo và khởi chạy theo tùy chọn người dùng
+    private void ToggleDemoAgents()
+    {
+        using var dlg = new DemoSimulatorForm(_demoConfig, _demoCts != null);
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+        StopAllDemoAgents(silent: dlg.StopRequested == false);
+
+        if (dlg.StopRequested)
+            return;
+
+        _demoConfig = dlg.ResultConfig;
+        StartDemoSimulation(_demoConfig);
+    }
+
+    private void StopAllDemoAgents(bool silent)
+    {
+        if (_demoCts == null) return;
+
+        _demoCts.Cancel();
+        _demoCts.Dispose();
+        _demoCts = null;
+        foreach (var kv in _demoAgentCts)
+            kv.Value.Dispose();
+        _demoAgentCts.Clear();
+
+        settingsDrawer.SetDemoActive(false);
+        if (!silent)
+            OnLogMessage($"[{DateTime.Now:HH:mm:ss}] [Demo] Đã dừng toàn bộ máy trạm ảo.");
+    }
+
+    private void StartDemoSimulation(DemoSimulationConfig cfg)
+    {
+        if (!_server.IsRunning)
+        {
+            _server.Start();
+            UpdateServerStatusUi();
+        }
+
+        _demoCts = new CancellationTokenSource();
+        settingsDrawer.SetDemoActive(true);
+        OnLogMessage($"[{DateTime.Now:HH:mm:ss}] [Demo] Đang khởi tạo {cfg.MachineCount} máy trạm ảo ({cfg.NamePrefix}-01..{cfg.MachineCount:D2})...");
+
+        var rng = new Random();
+        string[] winVersions = { "Windows 11 Pro 24H2", "Windows 11 Enterprise", "Windows 10 Pro" };
+        string[] linuxVersions = { "Ubuntu 24.04 LTS", "Debian 12 Bookworm", "Rocky Linux 9" };
+
+        for (int i = 1; i <= cfg.MachineCount; i++)
+        {
+            string name = $"{cfg.NamePrefix}-{i:D2}";
+            string ip = $"192.168.1.{100 + i}";
+            string os = cfg.OsChoice switch
+            {
+                DemoOsChoice.Windows11 => winVersions[i % 2],
+                DemoOsChoice.Ubuntu => linuxVersions[i % linuxVersions.Length],
+                _ => (i % 3 == 0) ? linuxVersions[i % linuxVersions.Length] : winVersions[i % winVersions.Length]
+            };
+
+            (int baseCpu, int baseRam, int baseDisk) = cfg.Profile switch
+            {
+                DemoLoadProfile.Normal => (rng.Next(15, 42), rng.Next(30, 58), rng.Next(35, 65)),
+                DemoLoadProfile.Overload => (rng.Next(84, 96), rng.Next(86, 97), rng.Next(88, 96)),
+                DemoLoadProfile.Fluctuating => (rng.Next(25, 78), rng.Next(40, 82), rng.Next(40, 75)),
+                _ => (i % 3 == 0)
+                    ? (rng.Next(82, 95), rng.Next(84, 96), rng.Next(85, 95))
+                    : (rng.Next(18, 52), rng.Next(35, 68), rng.Next(35, 72))
+            };
+
+            int jitter = cfg.Profile == DemoLoadProfile.Fluctuating ? 28 : 10;
+            string key = $"{name}@{ip}";
+            var linked = CancellationTokenSource.CreateLinkedTokenSource(_demoCts.Token);
+            _demoAgentCts[key] = linked;
+            _ = RunDemoAgentAsync(name, ip, os, baseCpu, baseRam, baseDisk, jitter, linked.Token);
+        }
+
+        if (cfg.SimulateRandomDrop)
+            _ = RunRandomDropLoopAsync(_demoCts.Token);
+    }
+
+    private async Task RunRandomDropLoopAsync(CancellationToken ct)
+    {
+        var rng = new Random();
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(15000, ct);
+                var keys = _demoAgentCts.Keys.ToList();
+                if (keys.Count == 0) break;
+
+                string pick = keys[rng.Next(keys.Count)];
+                if (_demoAgentCts.TryRemove(pick, out var cts))
+                {
+                    cts.Cancel();
+                    cts.Dispose();
+                    OnLogMessage($"[{DateTime.Now:HH:mm:ss}] [Demo] Giả lập rớt mạng ngẫu nhiên cho '{pick}'.");
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private static async Task RunDemoAgentAsync(
+        string name, string ip, string os,
+        int baseCpu, int baseRam, int baseDisk, int jitter,
+        CancellationToken ct)
+    {
+        var rng = new Random(HashCode.Combine(name, Environment.TickCount));
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync("127.0.0.1", Protocol.TcpPort, ct);
+            using var stream = client.GetStream();
+            using var reader = new StreamReader(stream, Encoding.UTF8);
+            using var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true };
+
+            await writer.WriteAsync(Protocol.Build("HELLO", ("name", name), ("ip", ip), ("os", os)));
+
+            int interval = 3;
+            string? line = await reader.ReadLineAsync(ct);
+            if (line != null)
+            {
+                var (cmd, data) = Protocol.Parse(line);
+                if (cmd == "WELCOME" && data.TryGetValue("interval", out var s) && int.TryParse(s, out int n) && n > 0)
+                    interval = n;
+            }
+
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    int cpu = Math.Clamp(baseCpu + rng.Next(-jitter, jitter + 2), 3, 99);
+                    int ram = Math.Clamp(baseRam + rng.Next(-6, 8), 10, 99);
+                    int disk = Math.Clamp(baseDisk + rng.Next(-1, 2), 10, 99);
+
+                    await writer.WriteAsync(Protocol.Build("STATS",
+                        ("cpu", cpu.ToString()),
+                        ("ram", ram.ToString()),
+                        ("disk", disk.ToString())));
+
+                    await Task.Delay(interval * 1000, ct);
+                }
+            }
+            finally
+            {
+                try { await writer.WriteAsync(Protocol.Build("BYE")); } catch { }
+            }
+        }
+        catch { }
     }
 }
